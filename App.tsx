@@ -678,6 +678,9 @@ const App: React.FC = () => {
         if (phoneDigits && phoneDigits.length >= 3) {
           orConditions.push(`customer_phone.ilike.%${phoneDigits}%`);
         }
+        if (digits && digits.length >= 4) {
+          orConditions.push(`customer_phone.ilike.%${digits}%`);
+        }
         const isCleanUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cleanQ);
         if (isCleanUUID) {
           orConditions.push(`id.eq.${cleanQ}`);
@@ -689,8 +692,11 @@ const App: React.FC = () => {
           return;
         }
 
-        // 1. Try querying within current laundry tenant if applicable
-        let data: any[] | null = null;
+        // Search across the database and include all matching records (both tenant and global DB)
+        // so no orders (historical or current) are ever omitted
+        const mergedMap = new Map<string, any>();
+
+        // 1. Query within current laundry tenant if applicable
         if (isDbMultiTenant && userProfile?.laundry_id) {
           const { data: tenantData } = await supabase
             .from('orders')
@@ -698,26 +704,32 @@ const App: React.FC = () => {
             .eq('laundry_id', userProfile.laundry_id)
             .or(orConditions.join(','))
             .order('created_at', { ascending: false })
-            .limit(500);
+            .limit(1000);
 
           if (tenantData && tenantData.length > 0) {
-            data = tenantData;
+            tenantData.forEach((item: any) => {
+              if (item?.id) mergedMap.set(item.id, item);
+            });
           }
         }
 
-        // 2. If not found or not multi-tenant, query across the ENTIRE database
-        if (!data || data.length === 0) {
-          const { data: allDbData } = await supabase
-            .from('orders')
-            .select('*')
-            .or(orConditions.join(','))
-            .order('created_at', { ascending: false })
-            .limit(500);
+        // 2. ALWAYS also query across the ENTIRE database to catch any matching orders across all sessions or historical imports
+        const { data: allDbData } = await supabase
+          .from('orders')
+          .select('*')
+          .or(orConditions.join(','))
+          .order('created_at', { ascending: false })
+          .limit(1000);
 
-          if (allDbData && allDbData.length > 0) {
-            data = allDbData;
-          }
+        if (allDbData && allDbData.length > 0) {
+          allDbData.forEach((item: any) => {
+            if (item?.id && !mergedMap.has(item.id)) {
+              mergedMap.set(item.id, item);
+            }
+          });
         }
+
+        const data = Array.from(mergedMap.values());
 
         if (data && data.length > 0) {
           const cleanResults = data.map((o: any) => ({
@@ -7610,9 +7622,40 @@ const App: React.FC = () => {
     setFinanceOrdersCurrentPage(1);
   }, [financeClientSearch, financePendingFilter, financeSelectedClientPhone, financeFromDate, financeToDate]);
 
-  // Reset customer orders modal page when customer changes
+  // Reset customer orders modal page and fetch all orders for this customer from database
   useEffect(() => {
     setCustomerModalOrdersPage(1);
+    if (!selectedCustomerForOrders?.phone) return;
+
+    const fetchAllCustomerOrders = async () => {
+      const ph = selectedCustomerForOrders.phone.trim();
+      const phoneDigits = ph.replace(/\D/g, '');
+      const orConditions: string[] = [`customer_phone.eq.${ph}`];
+      if (phoneDigits && phoneDigits.length >= 7) {
+        orConditions.push(`customer_phone.ilike.%${phoneDigits}%`);
+      }
+      try {
+        const { data: custData } = await supabase
+          .from('orders')
+          .select('*')
+          .or(orConditions.join(','))
+          .order('created_at', { ascending: false });
+
+        if (custData && custData.length > 0) {
+          const cleanCustOrders = custData.map((o: any) => ({
+            ...o,
+            order_number: cleanTenantString(o.order_number),
+            customer_name: cleanTenantString(o.customer_name),
+            customer_phone: cleanTenantString(o.customer_phone)
+          }));
+          setOrders(prev => deduplicateOrders([...cleanCustOrders, ...prev]));
+        }
+      } catch (err) {
+        console.warn('Error fetching all customer orders for modal:', err);
+      }
+    };
+
+    fetchAllCustomerOrders();
   }, [selectedCustomerForOrders]);
 
   if (!session) {
